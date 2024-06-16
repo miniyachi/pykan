@@ -3,7 +3,8 @@ from torch.optim import Optimizer
 from torch.func import vmap
 import torch.nn.functional as F
 
-from pyhessian.utils import group_product, group_add, normalization, get_params_grad, hessian_vector_product
+from pyhessian.utils import group_product, group_add, orthnormal, normalization
+from opt_utils import group_scalar
 
 class SFN(Optimizer):
     """
@@ -19,7 +20,7 @@ class SFN(Optimizer):
         chunk_size (int): number of Hessian-vector products to compute in parallel
         verbose (bool): option to print out eigenvalues of Hessian approximation
     """
-    def __init__(self, params, lr=0.001, rho=0.1, delta=1.0, chunk_size=1, verbose=False):
+    def __init__(self, params, lr=0.001, radius=0.1, delta=0.01, chunk_size=1, verbose=False):
         """
         Initialize the SFN optimizer.
 
@@ -28,12 +29,10 @@ class SFN(Optimizer):
         lr (float): Learning rate (default: 1.0).
         damping (float): Damping factor to ensure positive definiteness (default: 1e-4).
         """
-        defaults = dict(lr=lr, rho=rho, delta=delta, chunk_size=chunk_size, verbose=verbose)
+        defaults = dict(lr=lr, radius=radius, delta=delta, chunk_size=chunk_size, verbose=verbose)
         self.delta = delta
         self.chunk_size = chunk_size
         self.verbose = verbose
-        self.U = None
-        self.S = None
         self.n_iters = 0
 
         super(SFN, self).__init__(params, defaults)
@@ -41,119 +40,176 @@ class SFN(Optimizer):
         if len(self.param_groups) > 1:
             raise ValueError("Currently doesn't support per-parameter options (parameter groups)")
 
-    def step(self, closure=None):
+    def step(self, gradsH_tuple, closure=None):
         """
         Performs a single optimization step.
 
-        Arguments:
-        closure (callable, optional): A closure that re-evaluates the model and returns the loss.
+        Args:
+            closure (callable, optional): A closure that reevaluates the model and returns (i) the loss and (ii) gradient w.r.t. the parameters.
+            The closure can compute the gradient w.r.t. the parameters by calling torch.autograd.grad on the loss with create_graph=True.
         """
         loss = None
         if closure is not None:
             loss = closure()
+
+        # Get the parameters as a list
+        params = []
+        # gradsH = []
+        for group in self.param_groups:
+            for param in group['params']:
+                params.append(param)
+                # if param.grad is not None:
+                #     gradsH.append(param.grad)
         
-        g = torch.cat([p.grad.view(-1) for group in self.param_groups for p in group['params'] if p.grad is not None])
-        g = g.detach()
+        # Get the gradients as a list
+        gradsH = []
+        for gradient in gradsH_tuple:
+            if gradient is not None:
+                gradsH.append(gradient)
+
+        # Compute the augmented direction
+        _, dir_aug = self.appx_min_eigvec(gradsH, params)
+
+        # Obtain homogenized direction
+        if torch.abs(dir_aug[-1]) > 1e-6:
+            dir = group_scalar(dir_aug[:-1], 1/dir_aug[-1])
+        else:
+            dir = group_scalar(dir_aug[:-1], torch.sign(-group_product(gradsH, dir_aug[:-1])))
+
+        # Check if d is a descent direction
+        if group_product(dir, gradsH) >= 0:
+            print("Warning: dir is not a descent direction. dot(grad, d) = ", group_product(dir, gradsH))
 
         for group in self.param_groups:
             lr = group['lr']
-            rho = group['rho']
 
-            # Compute preconditioned direction
-            UTg = torch.mv(self.U.t(), g)
-            dir = torch.mv(self.U, (torch.abs(self.S) + rho).reciprocal() * UTg) + g / rho - torch.mv(self.U, UTg) / rho
+        #     norm_dir = torch.sqrt(sum([torch.norm(d)**2 for d in dir]))
+        #     if norm_dir > lr:
+        #         alpha = lr / norm_dir
+        #         alpha = alpha.cpu().item()
+        #         if self.verbose:
+        #             print(f'Projected direction with norm {norm_dir} to norm {lr} with alpha = {alpha}')
+        #     else:
+        #         alpha = 1.0
+        #         if self.verbose:
+        #             print(f'Projected direction with norm {norm_dir} without scaling')
 
             # Update model parameters
-            ls = 0
-            for p in group['params']:
-                np = torch.numel(p)
-                dp = dir[ls:ls+np].view(p.shape)
-                ls += np
-                p.data.add_(-dp , alpha=lr)
+            for (p, dp) in zip(group['params'], dir):
+                p.data.add_(dp , alpha=lr)
 
         self.n_iters += 1
                 
         return loss
     
-
-    def update_preconditioner(self, grad_tuple):
-        params = []
-
-        for group in self.param_groups:
-            for param in group['params']:
-                params.append(param)
-
-        gradsH = torch.cat([gradient.view(-1) for gradient in grad_tuple if gradient is not None])
-
-        p = gradsH.shape[0]
-        # Generate test matrix (NOTE: This is transposed test matrix)
-        crank = int(1.5 * self.rank) # oversampling for truncation 
-        Phi = torch.randn((crank, p), device = params[0].device) / (p ** 0.5)
-        Phi = torch.linalg.qr(Phi.t(), mode = 'reduced')[0].t()
-
-        # Compute the sketch
-        Y = self._hvp_vmap(gradsH, params)(Phi)
-
-        # Calculate shift
-        shift = torch.finfo(Y.dtype).eps
-        # Y_shifted = Y + shift * Phi
-
-        # Calculate core matrix Phi^T * H * Phi for eigen-decomposition
-        W = torch.mm(Y, Phi.t())
-        # W_shifted = torch.mm(Y_shifted, Phi.t())
-
-        # Compute eigen-decomposition of core matrix
-        eigs, eigvectors = torch.linalg.eigh(W)
-        # eigs, eigvectors = torch.linalg.eigh(W_shifted)
-        # eigs = eigs - shift
-
-        # Sort the indices based on the absolute eigvals in descending order
-        sorted_indices = torch.argsort(torch.abs(eigs), descending=True)
-
-        # Truncate the eigvals and eigvectors
-        sorted_indices = sorted_indices[:self.rank]
-        eigs = eigs[sorted_indices]
-        eigvectors = eigvectors[:, sorted_indices]
-
-        # Compute pseudo-inverse of the best rank
-        W_inv = torch.mm(eigvectors, torch.mm(torch.diag(1.0 / eigs), eigvectors.t()))
-
-        # Compute eigen-decomposition of Nystrom approximation
-        Q, R = torch.linalg.qr(Y.t(), mode = 'reduced')
-        eigtarget = torch.mm(R, torch.mm(W_inv, R.t()))
-        self.S, eigvectors = torch.linalg.eigh(eigtarget)
-        self.U = torch.mm(Q, eigvectors)
-
-        if self.verbose: 
-            print(f'Approximate eigenvalues = {self.S}')
     
-    def appx_min_eigvec(self, grad_tuple):
-        return None
+    def appx_min_eigvec(self, gradsH, params, iter=100):
+
+        device = params[0].device
+
+        v = [
+            torch.randint_like(p, high=2, device=device)
+            for p in params
+        ]
+        # generate Rademacher random variables
+        for v_i in v:
+            v_i[v_i == 0] = -1
+        # augment the vector with a scalar
+        v.append(torch.randint(2, (1,), device=device))
+        v = normalization(v)
+
+        # standard Lanczos algorithm initialization
+        v_list = [v]
+        w_list = []
+        alpha_list = []
+        beta_list = []
+        ############### Lanczos
+        for i in range(iter):
+            self.zero_grad()
+            Fv = [torch.zeros(p.size()).to(device) for p in params]
+            Fv.append(torch.zeros(1).to(device))   # add a scalar
+            if i == 0:
+                Fv = self._fvp(gradsH, params, v)
+                alpha = group_product(Fv, v)
+                alpha_list.append(alpha.cpu().item())
+                w = group_add(Fv, v, alpha=-alpha)
+                w_list.append(w)
+            else:
+                beta = torch.sqrt(group_product(w, w))
+                beta_list.append(beta.cpu().item())
+                if beta_list[-1] != 0.:
+                    # We should re-orth it
+                    v = orthnormal(w, v_list)
+                    v_list.append(v)
+                else:
+                    # generate a new vector
+                    w = [torch.randn(p.size()).to(device) for p in params]
+                    w.append(torch.randn(1).to(device))
+                    v = orthnormal(w, v_list)
+                    v_list.append(v)
+                Fv = self._fvp(gradsH, params, v)
+                alpha = group_product(Fv, v)
+                alpha_list.append(alpha.cpu().item())
+                w_tmp = group_add(Fv, v, alpha=-alpha)
+                w = group_add(w_tmp, v_list[-2], alpha=-beta)
+
+        T = torch.zeros(iter, iter).to(device)
+        for i in range(len(alpha_list)):
+            T[i, i] = alpha_list[i]
+            if i < len(alpha_list) - 1:
+                T[i + 1, i] = beta_list[i]
+                T[i, i + 1] = beta_list[i]
+        eigvals, eigvecs_T = torch.linalg.eigh(T)
+        
+        V = torch.stack([torch.cat([v_i.reshape(-1) for v_i in v]) for v in v_list])
+        tmp_vec = torch.mv(V.t(), eigvecs_T[:, 0])
+
+        ls = 0
+        min_eigvec = []
+        for p in params:
+                np = torch.numel(p)
+                min_eigvec.append(tmp_vec[ls:ls+np].view(p.shape))
+                ls += np
+        min_eigvec.append(tmp_vec[ls:])
+
+        if self.verbose:             
+            # Compute the residual
+            Fv = self._fvp(gradsH, params, min_eigvec)
+            lambdav = group_scalar(min_eigvec, eigvals[0])
+            r = group_add(Fv, lambdav, alpha=-1.0)
+            res = group_product(r, r)**0.5
+
+            print(f'Approximate minimum eigenvalue = {eigvals[0]},  Eigenvector residual = {res}')
+        
+        return eigvals[0], min_eigvec
     
-    def _fvp(self, grad_params, params, v): # v = [v, t]
+    def _fvp(self, grad_params, params, v): # v = [u, t]
         # Compute Hessian-vector product
         Hv = self._hvp(grad_params, params, v[:-1])
 
         # Multiply the last element of v with grad_params
-        tg = v[-1] * grad_params
+        tg = group_scalar(grad_params, v[-1])
 
         # Compute gTv
-        gTv = torch.dot(grad_params, v[:-1])
+        gTv = group_product(grad_params, v[:-1])
 
-        Hv_tg = Hv + tg
-        scalar = (gTv - self.delta * v[-1]).view(1)
+        output = group_add(Hv, tg)
+        output.append(gTv - self.delta * v[-1])
+        output = [out_i.detach() for out_i in output]
         
-        return torch.cat([Hv_tg, scalar])
+        return output
 
 
     def _hvp_vmap(self, grad_params, params):
-        return vmap(lambda v: self._hvp(grad_params, params, v), in_dims = 0, chunk_size=self.chunk_size)
+        return vmap(lambda v: self._hvp_cat(grad_params, params, v), in_dims = 0, chunk_size=self.chunk_size)
+
+    def _hvp_cat(self, grad_params, params, v):
+        return torch.cat([Hvi.reshape(-1) for Hvi in self._hvp(grad_params, params, v)])
 
     def _hvp(self, grad_params, params, v):
         Hv = torch.autograd.grad(grad_params, params, grad_outputs = v,
-                                retain_graph = True)
-        Hv = tuple(Hvi.detach() for Hvi in Hv)
-        return torch.cat([Hvi.reshape(-1) for Hvi in Hv])
+                                 retain_graph = True)
+        return [Hvi.detach() for Hvi in Hv]
 
 # Example usage
 if __name__ == "__main__":

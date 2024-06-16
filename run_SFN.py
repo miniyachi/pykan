@@ -55,7 +55,7 @@ def run(lr, proj_name, opt_name, run_name,
 
     if Opt == SFN:
         hes_update_freq = len(t_dl)
-        opt = Opt(model.parameters(), lr=lr, rho=0.1, rank=10, chunk_size=1, verbose=False)
+        opt = Opt(model.parameters(), lr=lr, delta=0.01, chunk_size=1, verbose=True)
     elif Opt == SGD:
         opt = Opt(model.parameters(), lr=lr, momentum=0.9)
     elif Opt == Adam:
@@ -71,27 +71,28 @@ def run(lr, proj_name, opt_name, run_name,
         model.train()
         epoch_start = timeit.default_timer()
         for x, y in t_dl:
-            # Infrequent updating for SFN
-            if isinstance(opt, SFN) and n_iters % hes_update_freq == 0:
+            # Get grad_tuple for Hessian
+            if isinstance(opt, SFN):
                 for x_h, y_h in t_dl_h:
                     x_h, y_h = x_h.to(device), y_h.to(device)
                     y_h_hat = model(x_h)
                     l_h = loss_fn(y_h_hat, y_h)
                     break
-                grad_tuple = torch.autograd.grad(l_h, model.parameters(), create_graph=True)
-                opt.update_preconditioner(grad_tuple)
+                gradsH_tuple = torch.autograd.grad(l_h, model.parameters(), create_graph=True)
 
             opt.zero_grad()
             x, y = x.to(device), y.to(device)
             y_hat = model(x)
             loss = loss_fn(y_hat, y)
-
             loss.backward()
-
-            opt.step()
+            
+            if isinstance(opt, SFN):
+                opt.step(gradsH_tuple)
+            else:
+                opt.step()
+            
             n_iters += 1
-            if n_iters % 100 == 0:
-                print(f"Epoch: {epoch}, Iteration: {n_iters}, Loss: {loss.item()}")
+            print(f"Epoch: {epoch}, Iteration: {n_iters}, Loss: {loss.item()}")
 
         scheduler.step()
         cum_time += timeit.default_timer() - epoch_start
@@ -166,7 +167,7 @@ def main():
 
     loss_fn = nn.CrossEntropyLoss(weight=class_weights)
 
-    hidden_layers = [512] * 9
+    hidden_layers = [512] * 1
 
     for lr in [1e-4, 1e-3, 1e-2, 1e-1]:
     # Get best learning rate by querying wandb

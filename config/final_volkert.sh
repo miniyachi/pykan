@@ -8,7 +8,7 @@ metric=valid_acc
 criteria=final
 opts=(sfn) #(sgd adam sfn)
 epochs=50 #105
-n_trials=3 #10
+n_trials=1 #10
 
 dataset=volkert
 
@@ -18,7 +18,7 @@ do
     python run_SFN.py --id $id \
                         --data_folder $data_folder \
                         --t_seed $t_seed \
-                        --proj_name final_${dataset} \
+                        --proj_name final_${dataset}_hsodm \
                         --entity_name $entity_name \
                         --tuning_name tune_${dataset}_${opt} \
                         --metric $metric \
